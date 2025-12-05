@@ -1,0 +1,71 @@
+name: Upload APK to Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: "رابط ملف APK من catbox أو غيره"
+        required: true
+      release_name:
+        description: "اسم الإصدار مثل radio أو azkar"
+        required: true
+      apk_filename:
+        description: "اسم ملف APK (مثل: radio أو azkar-v2)"
+        required: true
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: تنزيل ملف APK
+        run: |
+          mkdir temp
+          cd temp
+          # إضافة .apk تلقائياً إذا لم يكن موجوداً
+          FILENAME="${{ github.event.inputs.apk_filename }}"
+          if [[ ! "$FILENAME" =~ \.apk$ ]]; then
+            FILENAME="${FILENAME}.apk"
+          fi
+          echo "APK_FILENAME=$FILENAME" >> $GITHUB_ENV
+          wget "${{ github.event.inputs.apk_url }}" -O "$FILENAME"
+
+      - name: حذف الملف القديم إذا كان موجوداً
+        continue-on-error: true
+        run: |
+          # الحصول على معلومات الإصدار
+          RELEASE_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ github.event.inputs.release_name }}" \
+            | jq -r '.id')
+          
+          if [ "$RELEASE_ID" != "null" ] && [ -n "$RELEASE_ID" ]; then
+            echo "تم العثور على الإصدار: $RELEASE_ID"
+            
+            # البحث عن الملف بنفس الاسم
+            ASSET_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets" \
+              | jq -r '.[] | select(.name=="${{ env.APK_FILENAME }}") | .id')
+            
+            if [ -n "$ASSET_ID" ] && [ "$ASSET_ID" != "null" ]; then
+              echo "تم العثور على ملف قديم بنفس الاسم: $ASSET_ID"
+              echo "جاري حذف الملف القديم..."
+              
+              curl -X DELETE \
+                -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                "https://api.github.com/repos/${{ github.repository }}/releases/assets/$ASSET_ID"
+              
+              echo "تم حذف الملف القديم بنجاح"
+            else
+              echo "لا يوجد ملف قديم بنفس الاسم"
+            fi
+          else
+            echo "لا يوجد إصدار بهذا الاسم، سيتم إنشاء إصدار جديد"
+          fi
+
+      - name: رفع الملف إلى Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.release_name }}
+          name: ${{ github.event.inputs.release_name }}
+          files: temp/${{ env.APK_FILENAME }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
