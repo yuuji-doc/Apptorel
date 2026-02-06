@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       apk_url:
-        description: "رابط ملف APK من catbox أو غيره"
+        description: "رابط ملف APK من أي مصدر (catbox، GitHub، إلخ)"
         required: true
       release_name:
         description: "اسم الإصدار مثل radio أو azkar"
@@ -19,18 +19,61 @@ jobs:
     steps:
       - name: تنزيل ملف APK
         run: |
-          mkdir temp
+          mkdir -p temp
           cd temp
+          
           # إضافة .apk تلقائياً إذا لم يكن موجوداً
           FILENAME="${{ github.event.inputs.apk_filename }}"
           if [[ ! "$FILENAME" =~ \.apk$ ]]; then
             FILENAME="${FILENAME}.apk"
           fi
           echo "APK_FILENAME=$FILENAME" >> $GITHUB_ENV
-          wget "${{ github.event.inputs.apk_url }}" -O "$FILENAME"
+          
+          # استخدام curl بدلاً من wget لدعم أفضل لإعادة التوجيه
+          echo "جاري تنزيل الملف من: ${{ github.event.inputs.apk_url }}"
+          
+          # تنزيل الملف مع متابعة إعادة التوجيه وعرض التقدم
+          curl -L \
+            --fail \
+            --retry 3 \
+            --retry-delay 2 \
+            --max-time 300 \
+            --progress-bar \
+            -o "$FILENAME" \
+            "${{ github.event.inputs.apk_url }}"
+          
+          # التحقق من نجاح التنزيل
+          if [ ! -f "$FILENAME" ]; then
+            echo "❌ فشل تنزيل الملف"
+            exit 1
+          fi
+          
+          # التحقق من حجم الملف
+          FILE_SIZE=$(stat -f%z "$FILENAME" 2>/dev/null || stat -c%s "$FILENAME" 2>/dev/null)
+          if [ "$FILE_SIZE" -lt 1000 ]; then
+            echo "❌ الملف المحمّل صغير جداً، قد يكون هناك خطأ"
+            exit 1
+          fi
+          
+          echo "✅ تم تنزيل الملف بنجاح - الحجم: $FILE_SIZE بايت"
+
+      - name: التحقق من نوع الملف
+        run: |
+          cd temp
+          # التحقق من أن الملف هو APK فعلاً
+          file "${{ env.APK_FILENAME }}"
+          
+          # محاولة قراءة توقيع ZIP (APK هو ملف ZIP)
+          if ! head -c 4 "${{ env.APK_FILENAME }}" | grep -q "PK"; then
+            echo "⚠️ تحذير: الملف قد لا يكون APK صحيح"
+          else
+            echo "✅ الملف يبدو كملف APK صحيح"
+          fi
 
       - name: حذف الملف القديم إذا كان موجوداً
         continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # الحصول على معلومات الإصدار
           RELEASE_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
@@ -38,27 +81,27 @@ jobs:
             | jq -r '.id')
           
           if [ "$RELEASE_ID" != "null" ] && [ -n "$RELEASE_ID" ]; then
-            echo "تم العثور على الإصدار: $RELEASE_ID"
+            echo "✅ تم العثور على الإصدار: $RELEASE_ID"
             
             # البحث عن الملف بنفس الاسم
             ASSET_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
               "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets" \
-              | jq -r '.[] | select(.name=="${{ env.APK_FILENAME }}") | .id')
+              | jq -r ".[] | select(.name==\"${{ env.APK_FILENAME }}\") | .id")
             
             if [ -n "$ASSET_ID" ] && [ "$ASSET_ID" != "null" ]; then
-              echo "تم العثور على ملف قديم بنفس الاسم: $ASSET_ID"
+              echo "🗑️ تم العثور على ملف قديم بنفس الاسم: $ASSET_ID"
               echo "جاري حذف الملف القديم..."
               
               curl -X DELETE \
                 -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
                 "https://api.github.com/repos/${{ github.repository }}/releases/assets/$ASSET_ID"
               
-              echo "تم حذف الملف القديم بنجاح"
+              echo "✅ تم حذف الملف القديم بنجاح"
             else
-              echo "لا يوجد ملف قديم بنفس الاسم"
+              echo "ℹ️ لا يوجد ملف قديم بنفس الاسم"
             fi
           else
-            echo "لا يوجد إصدار بهذا الاسم، سيتم إنشاء إصدار جديد"
+            echo "ℹ️ لا يوجد إصدار بهذا الاسم، سيتم إنشاء إصدار جديد"
           fi
 
       - name: رفع الملف إلى Release
@@ -67,5 +110,14 @@ jobs:
           tag_name: ${{ github.event.inputs.release_name }}
           name: ${{ github.event.inputs.release_name }}
           files: temp/${{ env.APK_FILENAME }}
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: عرض معلومات الإصدار
+        run: |
+          echo "🎉 تم رفع الملف بنجاح!"
+          echo "📦 اسم الملف: ${{ env.APK_FILENAME }}"
+          echo "🏷️ اسم الإصدار: ${{ github.event.inputs.release_name }}"
+          echo "🔗 رابط الإصدار: https://github.com/${{ github.repository }}/releases/tag/${{ github.event.inputs.release_name }}"
