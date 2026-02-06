@@ -1,123 +1,138 @@
-name: Upload APK to Release
+name: Auto Upload APK to Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      apk_url:
-        description: "رابط ملف APK من أي مصدر (catbox، GitHub، إلخ)"
-        required: true
-      release_name:
-        description: "اسم الإصدار مثل radio أو azkar"
-        required: true
-      apk_filename:
-        description: "اسم ملف APK (مثل: radio أو azkar-v2)"
-        required: true
+  push:
+    paths:
+      - '*.apk'  # يعمل عند إضافة أي ملف APK في جذر المستودع
 
 jobs:
   upload:
     runs-on: ubuntu-latest
     steps:
-      - name: تنزيل ملف APK
-        run: |
-          mkdir -p temp
-          cd temp
-          
-          # إضافة .apk تلقائياً إذا لم يكن موجوداً
-          FILENAME="${{ github.event.inputs.apk_filename }}"
-          if [[ ! "$FILENAME" =~ \.apk$ ]]; then
-            FILENAME="${FILENAME}.apk"
-          fi
-          echo "APK_FILENAME=$FILENAME" >> $GITHUB_ENV
-          
-          # استخدام curl بدلاً من wget لدعم أفضل لإعادة التوجيه
-          echo "جاري تنزيل الملف من: ${{ github.event.inputs.apk_url }}"
-          
-          # تنزيل الملف مع متابعة إعادة التوجيه وعرض التقدم
-          curl -L \
-            --fail \
-            --retry 3 \
-            --retry-delay 2 \
-            --max-time 300 \
-            --progress-bar \
-            -o "$FILENAME" \
-            "${{ github.event.inputs.apk_url }}"
-          
-          # التحقق من نجاح التنزيل
-          if [ ! -f "$FILENAME" ]; then
-            echo "❌ فشل تنزيل الملف"
-            exit 1
-          fi
-          
-          # التحقق من حجم الملف
-          FILE_SIZE=$(stat -f%z "$FILENAME" 2>/dev/null || stat -c%s "$FILENAME" 2>/dev/null)
-          if [ "$FILE_SIZE" -lt 1000 ]; then
-            echo "❌ الملف المحمّل صغير جداً، قد يكون هناك خطأ"
-            exit 1
-          fi
-          
-          echo "✅ تم تنزيل الملف بنجاح - الحجم: $FILE_SIZE بايت"
-
-      - name: التحقق من نوع الملف
-        run: |
-          cd temp
-          # التحقق من أن الملف هو APK فعلاً
-          file "${{ env.APK_FILENAME }}"
-          
-          # محاولة قراءة توقيع ZIP (APK هو ملف ZIP)
-          if ! head -c 4 "${{ env.APK_FILENAME }}" | grep -q "PK"; then
-            echo "⚠️ تحذير: الملف قد لا يكون APK صحيح"
-          else
-            echo "✅ الملف يبدو كملف APK صحيح"
-          fi
-
-      - name: حذف الملف القديم إذا كان موجوداً
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # الحصول على معلومات الإصدار
-          RELEASE_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ github.event.inputs.release_name }}" \
-            | jq -r '.id')
-          
-          if [ "$RELEASE_ID" != "null" ] && [ -n "$RELEASE_ID" ]; then
-            echo "✅ تم العثور على الإصدار: $RELEASE_ID"
-            
-            # البحث عن الملف بنفس الاسم
-            ASSET_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets" \
-              | jq -r ".[] | select(.name==\"${{ env.APK_FILENAME }}\") | .id")
-            
-            if [ -n "$ASSET_ID" ] && [ "$ASSET_ID" != "null" ]; then
-              echo "🗑️ تم العثور على ملف قديم بنفس الاسم: $ASSET_ID"
-              echo "جاري حذف الملف القديم..."
-              
-              curl -X DELETE \
-                -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                "https://api.github.com/repos/${{ github.repository }}/releases/assets/$ASSET_ID"
-              
-              echo "✅ تم حذف الملف القديم بنجاح"
-            else
-              echo "ℹ️ لا يوجد ملف قديم بنفس الاسم"
-            fi
-          else
-            echo "ℹ️ لا يوجد إصدار بهذا الاسم، سيتم إنشاء إصدار جديد"
-          fi
-
-      - name: رفع الملف إلى Release
-        uses: softprops/action-gh-release@v1
+      - name: Checkout Repository
+        uses: actions/checkout@v4
         with:
-          tag_name: ${{ github.event.inputs.release_name }}
-          name: ${{ github.event.inputs.release_name }}
-          files: temp/${{ env.APK_FILENAME }}
-          draft: false
-          prerelease: false
+          fetch-depth: 2  # للحصول على التغييرات الأخيرة
+
+      - name: اكتشاف ملفات APK الجديدة
+        id: detect
+        run: |
+          # البحث عن جميع ملفات APK في جذر المستودع
+          APK_FILES=$(find . -maxdepth 1 -name "*.apk" -type f)
+          
+          if [ -z "$APK_FILES" ]; then
+            echo "ℹ️ لا توجد ملفات APK في جذر المستودع"
+            echo "has_apk=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "has_apk=true" >> $GITHUB_OUTPUT
+          
+          # حفظ قائمة الملفات
+          echo "$APK_FILES" > apk_list.txt
+          
+          echo "✅ تم اكتشاف الملفات التالية:"
+          cat apk_list.txt
+
+      - name: رفع كل ملف APK إلى Release منفصل
+        if: steps.detect.outputs.has_apk == 'true'
+        run: |
+          while IFS= read -r APK_FILE; do
+            # إزالة ./ من البداية
+            APK_FILE=${APK_FILE#./}
+            
+            # الحصول على اسم الملف بدون المسار
+            FILENAME=$(basename "$APK_FILE")
+            
+            # الحصول على اسم الإصدار (اسم الملف بدون .apk)
+            RELEASE_NAME="${FILENAME%.apk}"
+            
+            echo "════════════════════════════════════════"
+            echo "📦 معالجة: $FILENAME"
+            echo "🏷️ اسم الإصدار: $RELEASE_NAME"
+            echo "════════════════════════════════════════"
+            
+            # التحقق من نوع الملف
+            echo "🔍 التحقق من نوع الملف..."
+            file "$APK_FILE"
+            
+            if ! head -c 4 "$APK_FILE" | grep -q "PK"; then
+              echo "⚠️ تحذير: $FILENAME قد لا يكون APK صحيح، سيتم تخطيه"
+              continue
+            fi
+            
+            # الحصول على حجم الملف
+            FILE_SIZE=$(stat -c%s "$APK_FILE" 2>/dev/null)
+            echo "📊 حجم الملف: $FILE_SIZE بايت"
+            
+            if [ "$FILE_SIZE" -lt 1000 ]; then
+              echo "❌ الملف صغير جداً، سيتم تخطيه"
+              continue
+            fi
+            
+            # التحقق من وجود الإصدار والملف القديم
+            echo "🔍 البحث عن إصدار سابق..."
+            RELEASE_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/tags/$RELEASE_NAME" \
+              | jq -r '.id')
+            
+            if [ "$RELEASE_ID" != "null" ] && [ -n "$RELEASE_ID" ]; then
+              echo "✅ تم العثور على إصدار سابق: $RELEASE_ID"
+              
+              # البحث عن الملف القديم بنفس الاسم
+              ASSET_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets" \
+                | jq -r ".[] | select(.name==\"$FILENAME\") | .id")
+              
+              if [ -n "$ASSET_ID" ] && [ "$ASSET_ID" != "null" ]; then
+                echo "🗑️ حذف الملف القديم: $ASSET_ID"
+                curl -X DELETE \
+                  -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                  "https://api.github.com/repos/${{ github.repository }}/releases/assets/$ASSET_ID"
+                echo "✅ تم حذف الملف القديم"
+              fi
+            else
+              echo "ℹ️ لا يوجد إصدار سابق، سيتم إنشاء إصدار جديد"
+            fi
+            
+            # إنشاء أو تحديث الإصدار ورفع الملف
+            echo "📤 رفع الملف إلى Release..."
+            
+            # استخدام GitHub CLI لرفع الملف
+            gh release create "$RELEASE_NAME" "$APK_FILE" \
+              --title "$RELEASE_NAME" \
+              --notes "تم رفع $FILENAME تلقائياً من المستودع" \
+              --repo "${{ github.repository }}" \
+              || gh release upload "$RELEASE_NAME" "$APK_FILE" --clobber \
+              --repo "${{ github.repository }}"
+            
+            echo "✅ تم رفع $FILENAME بنجاح!"
+            echo "🔗 رابط الإصدار: https://github.com/${{ github.repository }}/releases/tag/$RELEASE_NAME"
+            echo ""
+            
+          done < apk_list.txt
+          
+          echo "════════════════════════════════════════"
+          echo "🎉 اكتملت العملية بنجاح!"
+          echo "════════════════════════════════════════"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: عرض معلومات الإصدار
+      - name: عرض ملخص النتائج
+        if: steps.detect.outputs.has_apk == 'true'
         run: |
-          echo "🎉 تم رفع الملف بنجاح!"
-          echo "📦 اسم الملف: ${{ env.APK_FILENAME }}"
-          echo "🏷️ اسم الإصدار: ${{ github.event.inputs.release_name }}"
-          echo "🔗 رابط الإصدار: https://github.com/${{ github.repository }}/releases/tag/${{ github.event.inputs.release_name }}"
+          echo "## 📊 ملخص الرفع" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| اسم الملف | اسم الإصدار | الحالة |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          while IFS= read -r APK_FILE; do
+            APK_FILE=${APK_FILE#./}
+            FILENAME=$(basename "$APK_FILE")
+            RELEASE_NAME="${FILENAME%.apk}"
+            echo "| $FILENAME | $RELEASE_NAME | ✅ نجح |" >> $GITHUB_STEP_SUMMARY
+          done < apk_list.txt
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 [عرض جميع الإصدارات](https://github.com/${{ github.repository }}/releases)" >> $GITHUB_STEP_SUMMARY
